@@ -12,7 +12,7 @@ from .flow import flow_allocation, network_flow
 from .utils import (reindex_by_bus_carrier, check_carriers, check_snapshots,
                     get_branches_i, split_one_ports, split_branches,
                     snapshot_weightings, split_one_ports,
-                    get_as_dense_by_bus_carrier)
+                    get_as_dense_by_bus_carrier, check_passive_branch_comps)
 from .linalg import norm
 from .convert import peer_to_peer, virtual_patterns
 from .breakdown import expand_by_source_type
@@ -247,6 +247,49 @@ def locational_market_price_diff(n, snapshots=None):
     return Incidence(n) @ locational_market_price(n, snapshots)
 
 
+def _has_kvl_shadowprices(n):
+    "Check whether shadow prices of the cycle constraints are available."
+    if 'mu_kirchhoff_voltage_law' in n.sub_networks_t:
+        return True
+    model = getattr(n, 'model', None)
+    return (model is not None and
+            'Kirchhoff-Voltage-Law' in model.constraints and
+            'dual' in model.constraints['Kirchhoff-Voltage-Law'].data)
+
+
+def _cycle_constraint_price_from_model(n, snapshots):
+    """
+    Cycle constraint price per branch and snapshot for networks optimized
+    with `n.optimize()`. There the shadow prices are only stored in the
+    linopy model, hence the cycle basis and impedances of the model are used.
+    """
+    con = n.model.constraints['Kirchhoff-Voltage-Law']
+    dual = con.dual
+    coeffs = con.coeffs * dual
+    labels = con.vars
+    snapshot_dim = 'snapshot'
+    cycle_dim = [d for d in dual.dims if d != snapshot_dim][0]
+    rows = pd.concat(
+        {'coeff': coeffs.transpose(snapshot_dim, cycle_dim, '_term')
+         .to_series(),
+         'label': labels.transpose(snapshot_dim, cycle_dim, '_term')
+         .to_series()}, axis=1)
+    rows = rows[rows.label >= 0].groupby(
+        [snapshot_dim, 'label']).coeff.sum().reset_index()
+
+    comps = [c for c in check_passive_branch_comps(None, n)
+             if f'{c}-s' in n.model.variables]
+    var = pd.concat(
+        {c: n.model.variables[f'{c}-s'].labels.to_series().rename('label')
+         .rename_axis([snapshot_dim, 'branch_i']) for c in comps},
+        names=['component']).reset_index()
+    price = rows.merge(var, on=[snapshot_dim, 'label'])\
+        .pivot_table(index=snapshot_dim, columns=['component', 'branch_i'],
+                     values='coeff', aggfunc='sum')
+    price = price.reindex(snapshots).fillna(0)
+    return DataArray(price, dims=['snapshot', 'branch'])
+
+
 def cycle_constraint_price(n, snapshots=None):
     """
     Calculate the cost per branch and snapshot for the cycle constraint
@@ -263,9 +306,11 @@ def cycle_constraint_price(n, snapshots=None):
         Cycle cost for passive branches, dimension {snapshot, branch}.
 
     """
-    C = Cycles(n)
     snapshots = check_snapshots(snapshots, n)
-    comps = n.passive_branch_components
+    if 'mu_kirchhoff_voltage_law' not in n.sub_networks_t:
+        return _cycle_constraint_price_from_model(n, snapshots)
+    C = Cycles(n)
+    comps = check_passive_branch_comps(None, n)
     z = impedance(n, comps, snapshots)
     sp = n.sub_networks_t.mu_kirchhoff_voltage_law.loc[snapshots]
     shadowprice = DataArray(sp, dims=['snapshot', 'cycle']) * 1e5
@@ -290,6 +335,11 @@ def cycle_constraint_cost(n, snapshots=None):
     """
     # Interesting fact: The cycle constraint cost are not weighted with
     # snapshot_weightings different to 1.
+    snapshots = check_snapshots(snapshots, n)
+    comps = check_passive_branch_comps(None, n)
+    if 'mu_kirchhoff_voltage_law' not in n.sub_networks_t:
+        f = network_flow(n, snapshots, comps)
+        return _cycle_constraint_price_from_model(n, snapshots) * f
     C = []
     i = 0
     for sub in n.sub_networks.obj:
@@ -300,8 +350,6 @@ def cycle_constraint_cost(n, snapshots=None):
         i += sub.C.shape[1]
         C.append(DataArray(sub.C.todense(), coords, ['branch', 'cycle']))
     C = concat(C, dim='cycle').fillna(0)
-    snapshots = check_snapshots(snapshots, n)
-    comps = n.passive_branch_components
     f = network_flow(n, snapshots, comps)
     z = impedance(n, comps)
     sp = n.sub_networks_t.mu_kirchhoff_voltage_law.loc[snapshots]
@@ -333,7 +381,7 @@ def congestion_revenue(n, snapshots=None, split=False):
     """
     cr = - locational_market_price_diff(n, snapshots).transpose() * \
         network_flow(n, snapshots) * snapshot_weightings(n, snapshots)
-    if 'mu_kirchhoff_voltage_law' in n.sub_networks_t:
+    if _has_kvl_shadowprices(n):
         cr += cycle_constraint_cost(n,
                                     snapshots).reindex_like(cr,
                                                             fill_value=0)
@@ -341,7 +389,8 @@ def congestion_revenue(n, snapshots=None, split=False):
         logger.warning(
             ' The cost of cycle constraints cannot be calculated, as '
             'the shadowprices for those are missing. Please solve the '
-            'network with `keep_shadowprices=True` for including them.')
+            'network with `keep_shadowprices=True` (or `assign_all_duals=True` for '
+            '`n.optimize`) for including them.')
     return split_branches(cr, n) if split else cr
 
 
@@ -390,7 +439,7 @@ def nodal_co2_price(n, snapshots=None, co2_attr='co2_emissions',
     c = 'Generator'
     if price is None:
         if co2_constr_name is None:
-            con_i = n.global_constraints.index
+            con_i = n.global_constraints.index.astype(str)
             co2_constr_name = con_i[con_i.str.contains('CO2', case=False) &
                                     con_i.str.contains('Limit', case=False)]
             if co2_constr_name.empty:
@@ -405,6 +454,10 @@ def nodal_co2_price(n, snapshots=None, co2_attr='co2_emissions',
                 ', setting CO₂ constraint cost to zero.')
             return reindex_by_bus_carrier(pd.Series(0, n.generators.index), c, n)
         price = n.global_constraints.mu[co2_constr_name]
+        # the sign convention of the dual differs between pypsa versions,
+        # the price of a binding upper limit is always positive
+        if n.global_constraints.sense[co2_constr_name] in ('<=', '<'):
+            price = abs(price)
     eff_emission = n.df(c).carrier.map(
         n.carriers[co2_attr]) / n.df(c).efficiency
     return price * reindex_by_bus_carrier(eff_emission, c, n)

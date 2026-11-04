@@ -21,6 +21,13 @@ import xarray as xr
 from pypsa.descriptors import nominal_attrs
 
 
+def get_network_ac_dc():
+    n = ntl.test.get_network_ac_dc()
+    # stored p_set of links stem from an old run, newer pypsa fixes the flows
+    n.links_t.p_set = n.links_t.p_set.iloc[:, :0]
+    return n
+
+
 def close(d1, d2): return d1.round(0) == d2.round(0)
 
 
@@ -35,10 +42,11 @@ def check_duality(n):
 
 
 def check_zero_profit_branches(n):
-    comps = sorted(n.branch_components)
+    comps = ntl.utils.check_branch_comps(None, n)
     cost_ext = pd.concat({c: n.df(c)[attr + '_opt'] * n.df(c).capital_cost
                           for c, attr in pypsa.descriptors.nominal_attrs.items()
-                          if c in comps})[comps]\
+                          if c in comps})\
+                 .reindex(ntl.utils.get_branches_i(n, comps), fill_value=0)\
                  .where(get_ext_branches_b(n).to_series(), 0)
     CR = congestion_revenue(n, split=True)['ext'].sum('snapshot')
     assert all(close(cost_ext - CR, xr.zeros_like(CR))), (
@@ -50,7 +58,7 @@ def check_zero_profit_generators(n):
                 .eval('p_nom_opt * capital_cost')\
                 .reindex(n.generators.index, fill_value=0)
     cost_inv = reindex_by_bus_carrier(cost_inv, 'Generator', n).sum('carrier')
-    w = n.snapshot_weightings
+    w = n.snapshot_weightings.generators
     cost_op = (
         n.generators_t.p *
         n.generators.marginal_cost).mul(
@@ -81,7 +89,7 @@ def test_duality_wo_investment():
     n = ntl.test.get_network_mini()
     for c, attr in nominal_attrs.items():
         n.df(c)[attr + '_extendable'] = False
-    n.lopf(pyomo=False, keep_shadowprices=True, solver_name='cbc')
+    n.optimize(solver_name='highs', assign_all_duals=True)
     check_duality(n)
     check_zero_profit_branches(n)
 
@@ -91,53 +99,53 @@ def test_duality_wo_investment_sn_weightings():
     for c, attr in nominal_attrs.items():
         n.df(c)[attr + '_extendable'] = False
     n.snapshot_weightings[:] = 3
-    n.lopf(pyomo=False, keep_shadowprices=True, solver_name='cbc')
+    n.optimize(solver_name='highs', assign_all_duals=True)
     check_duality(n)
     check_zero_profit_branches(n)
 
 
 def test_duality_with_investment_wo_CO2():
-    n = ntl.test.get_network_ac_dc()
+    n = get_network_ac_dc()
     n.generators['p_nom_min'] = 0
     n.remove('GlobalConstraint', 'co2_limit')
-    n.lopf(pyomo=False, keep_shadowprices=True, solver_name='cbc')
+    n.optimize(solver_name='highs', assign_all_duals=True)
     check_duality(n)
     check_zero_profit_branches(n)
     check_zero_profit_generators(n)
 
 
 def test_duality_with_investment():
-    n = ntl.test.get_network_ac_dc()
+    n = get_network_ac_dc()
     for c, attr in pypsa.descriptors.nominal_attrs.items():
         n.df(c)[attr] = 0
-    n.lopf(pyomo=False, keep_shadowprices=True, solver_name='cbc')
+    n.optimize(solver_name='highs', assign_all_duals=True)
     check_duality(n)
     check_zero_profit_branches(n)
     check_zero_profit_generators(n)
 
 
 def test_duality_with_investment_sn_weightings():
-    n = ntl.test.get_network_ac_dc()
+    n = get_network_ac_dc()
     n.snapshot_weightings[:] = 3
     n.global_constraints.constant *= 3
-    n.lopf(pyomo=False, keep_shadowprices=False, solver_name='cbc')
+    n.optimize(solver_name='highs', assign_all_duals=True)
     check_duality(n)
     check_zero_profit_branches(n)
     check_zero_profit_generators(n)
 
 
 def test_duality_investment_mix_ext_nonext_lines():
-    n = ntl.test.get_network_ac_dc()
+    n = get_network_ac_dc()
     n.lines.loc['0', 's_nom_extendable'] = False
-    n.lopf(pyomo=False, keep_shadowprices=True, solver_name='cbc')
+    n.optimize(solver_name='highs', assign_all_duals=True)
     check_duality(n)
     check_zero_profit_branches(n)
     check_zero_profit_generators(n)
 
 
 def allocate_revenue():
-    n = ntl.test.get_network_ac_dc()
-    n.lopf(pyomo=False, keep_shadowprices=True, solver_name='cbc')
+    n = get_network_ac_dc()
+    n.optimize(solver_name='highs', assign_all_duals=True)
     ds = ntl.allocate_revenue(n)
 
     payment = ds.sum([d for d in ds.dims if d.startswith('receiver')])
@@ -153,11 +161,11 @@ def allocate_revenue():
 
 
 # def test_cost_allocation():
-#     n = ntl.test.get_network_ac_dc()
+#     n = get_network_ac_dc()
 #     n.set_snapshots(n.snapshots[:2])
 #     n.carriers = n.carriers.drop('battery')
 #     n.generators['p_nom_min'] = 0
-#     n.lopf(pyomo=False, keep_shadowprices=True, solver_name='cbc')
+#     n.optimize(solver_name='highs', assign_all_duals=True)
 #     d = power_demand(n)
 #     y = locational_market_price(n)
 

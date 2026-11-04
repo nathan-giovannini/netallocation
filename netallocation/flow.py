@@ -585,73 +585,46 @@ def with_and_without_transit(n, snapshots=None, branch_components=None):
         method='With-and-Without-Transit').fillna(0)
 
 
-def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
-                                  return_networks=False):
-    import pyomo.environ as pe
-    from .opf import (extract_optimisation_results,
-                      define_passive_branch_flows_with_kirchhoff)
+def marginal_welfare_contribution(n, snapshots=None, solver_name='highs',
+                                  return_networks=False, **kwargs):
+    """
+    Optimise the network once as a whole and once for each line removed. The
+    profit per generator is returned for each of the optimisations.
 
-    def fmap(f, iterable):
-        # mapper for inplace functions
-        for x in iterable:
-            f(x)
+    Parameters
+    ----------
+    n : pypsa.Network
+    snapshots : subset of n.snapshots
+        The default None results in taking all snapshots of n.
+    solver_name : str, default 'highs'
+        Solver passed to `n.optimize`.
+    return_networks : bool, default False
+        Whether to return the solved networks instead of the generator
+        profits.
+    **kwargs
+        Further arguments passed to `n.optimize`.
 
+    """
     def profit_by_gen(n):
         price_by_generator = (n.buses_t.marginal_price
                               .reindex(columns=n.generators.bus)
-                              .set_axis(n.generators.index, axis=1,
-                                        inplace=False))
+                              .set_axis(n.generators.index, axis=1))
         revenue = price_by_generator * n.generators_t.p
         cost = n.generators_t.p.multiply(n.generators.marginal_cost, axis=1)
         return ((revenue - cost).rename_axis('profit')
                 .rename_axis('generator', axis=1))
 
     snapshots = check_snapshots(snapshots, n)
-    n.lopf(snapshots, solver_name='gurobi_persistent', formulation=formulation)
-    m = n.model
+    n.optimize(snapshots, solver_name=solver_name, **kwargs)
 
     networks = {}
     networks['orig_model'] = n if return_networks else profit_by_gen(n)
 
-    m.zero_flow_con = pe.ConstraintList()
-
     for line in n.lines.index:
-        #        m.solutions.load_from(n.results)
         n_temp = n.copy()
-        n_temp.model = m
-        n_temp.mremove('Line', [line])
-
-        # set line flow to zero
-        line_var = m.passive_branch_p['Line', line, :]
-        fmap(lambda ln: m.zero_flow_con.add(ln == 0), line_var)
-
-        fmap(n.opt.add_constraint, m.zero_flow_con.values())
-
-        # remove cycle constraint from persistent solver
-        fmap(n.opt.remove_constraint, m.cycle_constraints.values())
-
-        # remove cycle constraint from model
-        fmap(m.del_component, [c for c in dir(m) if 'cycle_constr' in c])
-        # add new cycle constraint to model
-        define_passive_branch_flows_with_kirchhoff(n_temp, snapshots, True)
-        # add cycle constraint to persistent solver
-        fmap(n.opt.add_constraint, m.cycle_constraints.values())
-
-        # solve
-        n_temp.results = n.opt.solve()
-        m.solutions.load_from(n_temp.results)
-
-        # extract results
-        extract_optimisation_results(n_temp, snapshots,
-                                     formulation='kirchhoff')
-
-        if not return_networks:
-            n_temp = profit_by_gen(n_temp)
-        networks[line] = n_temp
-
-        # reset model
-        fmap(n.opt.remove_constraint, m.zero_flow_con.values())
-        m.zero_flow_con.clear()
+        n_temp.remove('Line', line)
+        n_temp.optimize(snapshots, solver_name=solver_name, **kwargs)
+        networks[line] = n_temp if return_networks else profit_by_gen(n_temp)
 
     return (pd.Series(networks)
             .rename_axis('removed line')

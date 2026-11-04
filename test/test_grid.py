@@ -13,6 +13,7 @@ from netallocation.utils import as_dense
 import netallocation as ntl
 import xarray as xr
 import pypsa
+import numpy as np
 from xarray.testing import assert_allclose, assert_equal
 from numpy.testing import assert_allclose as np_assert_allclose, \
     assert_array_equal as np_assert_equal
@@ -53,19 +54,14 @@ def test_bus_order():
 
 
 def test_cycles():
-    # since cycles are degenerated use single detection
-    C = ntl.grid.Cycles(n)
-    pypsa.pf.find_cycles(n)
-    C2 = xr.DataArray(
-        n.C.todense(), {
-            'branch': n.branches().index, 'cycle': range(
-                C.shape[1])}, [
-            'branch', 'cycle']).reindex_like(C)
-    Cp = C.to_pandas().T
-
-    def cycle_in_C(cycle):
-        return (cycle == Cp).all(1).any() or (cycle == - Cp).all(1).any()
-    assert C2.to_pandas().apply(cycle_in_C).all()
+    # the cycle basis is not unique, hence check that both span the same space
+    passive_i = ntl.utils.get_branches_i(n, n.passive_branch_components)
+    C = ntl.grid.Cycles(n, passive_i).to_pandas()
+    C2 = n.cycle_matrix().reindex(passive_i, fill_value=0)
+    assert C.shape == C2.shape
+    coeffs = np.linalg.lstsq(C.values, C2.values, rcond=None)[0]
+    np_assert_allclose(C.values @ coeffs, C2.values, atol=1e-8)
+    assert np.linalg.matrix_rank(C.values) == C.shape[1]
 
 
 def test_ordinary_PTDF():
