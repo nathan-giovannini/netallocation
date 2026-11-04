@@ -10,7 +10,7 @@ from xarray import DataArray
 import numpy as np
 from .linalg import pinv, diag, null, dot
 from .utils import (get_branches_i, reindex_by_bus_carrier, check_branch_comps,
-                    check_snapshots, check_passive_branch_comps,
+                    check_snapshots, check_passive_branch_comps, check_one_port_comps,
                     snapshot_weightings)
 from sparse import as_coo
 import logging
@@ -39,11 +39,19 @@ def Incidence(n, branch_components=None, sparse=False):
 
     """
     branch_components = check_branch_comps(branch_components, n)
-    if sparse:
-        K = as_coo(n.incidence_matrix(branch_components))
-    else:
-        K = n.incidence_matrix(branch_components).todense()
     branches_i = get_branches_i(n, branch_components)
+    # build the matrix directly to guarantee the order of branches and buses
+    # independent of the pypsa version
+    buses_i = n.buses.index
+    ends = pd.concat({c: n.df(c)[['bus0', 'bus1']] for c in branch_components})
+    cols = np.arange(len(ends))
+    rows0 = buses_i.get_indexer(ends['bus0'])
+    rows1 = buses_i.get_indexer(ends['bus1'])
+    K = scipy.sparse.coo_matrix(
+        (np.r_[np.ones(len(cols)), -np.ones(len(cols))],
+         (np.r_[rows0, rows1], np.r_[cols, cols])),
+        shape=(len(buses_i), len(cols)))
+    K = as_coo(K) if sparse else K.toarray()
     return DataArray(
         K,
         coords=(
@@ -54,13 +62,25 @@ def Incidence(n, branch_components=None, sparse=False):
             'branch'])
 
 
+def _select_component(da, c):
+    """
+    Select all branches of component c from an array with a (component,
+    branch_i) multiindexed 'branch' dimension. The remaining dimension is
+    always named 'branch', independent of the xarray version.
+    """
+    da = da.loc[c]
+    if 'branch_i' in da.dims:
+        da = da.rename({'branch_i': 'branch'})
+    return da
+
+
 def Cycles(n, branches_i=None):
     """
     Light-weight function for finding all cycles a given network.
 
     """
     branches = pd.concat({c: n.df(c)[['bus0', 'bus1']] for c in
-                          sorted(n.branch_components)})\
+                          check_branch_comps(None, n)})\
         .rename(columns={'bus0': 'source', 'bus1': 'target'})
     if branches_i is None:
         branches_i = branches.index.rename(['component', 'branch_i'])
@@ -70,7 +90,7 @@ def Cycles(n, branches_i=None):
     branches_bus0 = branches['source']
     mgraph = nx.from_pandas_edgelist(branches, edge_attr=True,
                                      create_using=nx.MultiGraph)
-    graph = nx.OrderedGraph(mgraph)
+    graph = nx.Graph(mgraph)
     cycles = nx.cycle_basis(graph)
     # number of 2-edge cycles
     num_multi = len(mgraph.edges()) - len(graph.edges())
@@ -171,26 +191,28 @@ def impedance(n, branch_components=None, snapshot=None,
     f = network_flow(n, snapshot)
     branches_i = f.get_index('branch')
     C = Cycles(n, branches_i[abs(f).values > 1e-8])\
-        .reindex(branch=branches_i, fill_value=0)
+        .reindex_like(f, fill_value=0)
     # C_mix is all the active cycles where at least one link is included
     C_mix = C[:, ((C != 0) & (f != 0)).groupby(
         'component').any().loc['Link'].values]
 
+    f_link = _select_component(f, 'Link')
+    C_link = _select_component(C_mix, 'Link')
     if not C_mix.size:
-        sub = f.loc['Link'][abs(f.loc['Link']).values > 1e-8]
+        sub = f_link[abs(f_link).values > 1e-8]
         omega = DataArray(1, sub.coords)
     elif not z.size:
-        omega = null(C_mix.loc['Link'] * f.loc['Link'])[0]
+        omega = null(C_link * f_link)[0]
     else:
         d = {'branch': 'Link'}
-        omega = - dot(pinv(dot(C_mix.loc['Link'].T, diag(f.loc['Link']))),
+        omega = - dot(pinv(dot(C_link.T, diag(f_link))),
                       dot(C_mix.drop_sel(d).T, diag(z), f.drop_sel(d)))
 
     omega = omega.round(10).assign_coords({'component': 'Link'})
-    omega[(omega == 0) & (f.loc['Link'] != 0)] = 1
+    omega[(omega == 0) & (f_link != 0)] = 1
     Z = z.reindex_like(f).copy()
-    links_i = branches_i[branches_i.get_loc('Link')]
-    Z.loc[links_i] = omega.reindex_like(f.loc['Link'], fill_value=0)
+    Z.values[branches_i.get_loc('Link')] = \
+        omega.reindex_like(f_link, fill_value=0).values
     return Z.assign_coords(snapshot=snapshot)
 
 
@@ -429,7 +451,7 @@ def _one_port_attr(n, snapshots=None, attr='p', comps=None):
     """
     snapshots = check_snapshots(snapshots, n)
     if comps is None:
-        comps = [c for c in sorted(n.one_port_components) if not n.df(c).empty]
+        comps = [c for c in check_one_port_comps(None, n) if not n.df(c).empty]
     gen = (reindex_by_bus_carrier(n.pnl(c)[attr].loc[snapshots] * n.df(c).sign,
                                   c, n) for c in comps)
     return xr.concat(gen, dim='carrier', fill_value=0)
@@ -490,9 +512,7 @@ def energy_production(n, snapshots=None, per_carrier=False, update=False):
 
     """
     snapshots = check_snapshots(snapshots, n)
-    sn_weightings = DataArray(
-        n.snapshot_weightings.loc[snapshots],
-        dims='snapshot')
+    sn_weightings = snapshot_weightings(n, snapshots)
     return power_production(n, snapshots, per_carrier, update) * sn_weightings
 
 

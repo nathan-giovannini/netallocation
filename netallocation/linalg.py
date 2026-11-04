@@ -25,7 +25,7 @@ def lower(df):
 
 
 def pinv(df):
-    return DataArray(np.linalg.pinv(df), df.T.coords)
+    return DataArray(np.linalg.pinv(df), df.T.coords, df.T.dims)
 
 
 def inv(df, pre_clean=False):
@@ -38,17 +38,17 @@ def inv(df, pre_clean=False):
                 np.isin(np.arange(data.shape[1]), data.coords[1])
             subdf = df[mask][:, mask]
             return DataArray(as_coo(sp_inv(subdf.data.tocsc())),
-                             subdf.T.coords) .reindex(**{df.dims[0]: df.get_index(df.dims[0])},
+                             subdf.T.coords, subdf.T.dims) .reindex(**{df.dims[0]: df.get_index(df.dims[0])},
                                                       fill_value=0) .reindex(**{df.dims[1]: df.get_index(df.dims[1])},
                                                                              fill_value=0)
-        return DataArray(as_coo(sp_inv(df.data.tocsc())), df.T.coords)
+        return DataArray(as_coo(sp_inv(df.data.tocsc())), df.T.coords, df.T.dims)
     if pre_clean:
         zeros_b = df == 0
         mask = tuple(df.get_index(d)[~zeros_b.all(d).data] for d in df.dims)
         subdf = df.loc[mask]
         return DataArray(np.linalg.inv(subdf), subdf.T.coords,
                          subdf.dims[::-1]) .reindex(df.T.coords, fill_value=0)
-    return DataArray(np.linalg.inv(df), df.T.coords)
+    return DataArray(np.linalg.inv(df), df.T.coords, df.T.dims)
 
 
 def dedup_axis(da, newdims):

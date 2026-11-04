@@ -9,11 +9,18 @@ Created on Thu Mar  7 16:13:57 2019
 from .plot_helpers import make_legend_circles_for, fuel_colors, \
     make_handler_map_to_scale_circles_as_in, handles_labels_for
 from .utils import as_dense, filter_null
-from pypsa.plot import projected_area_factor
+try:
+    from pypsa.geo import get_projected_area_factor as projected_area_factor
+except ImportError:  # pypsa < 0.34
+    from pypsa.plot import projected_area_factor
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
 import pypsa
+try:
+    from pypsa.common import Dict
+except ImportError:  # pypsa < 0.34
+    from pypsa.descriptors import Dict
 import numpy as np
 from matplotlib.colors import to_hex, to_rgba
 import logging
@@ -384,10 +391,10 @@ def fact_sheet(n, fn_out=None):
 
     """
     efactor = 1e6  # give power in TWh
-    hfactor = n.snapshot_weightings[0]  # total energy in elapsed hours
+    hfactor = n.snapshot_weightings['generators'].iloc[0]  # total energy in elapsed hours
 
     carriers = n.generators.carrier
-    d = pypsa.descriptors.Dict()
+    d = Dict()
 
     d['Unit'] = f'10^{int(np.log10(efactor * 1e6))} Wh'
     d['Capacity [unit * 10^3]'] = n.generators.groupby('carrier').p_nom_opt.sum(

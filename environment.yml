@@ -9,6 +9,6 @@ dependencies:
   - geopandas
   - xarray
   - dask 
-  - pypsa
+  - pypsa>=1.0
   - pip:
     - netallocation

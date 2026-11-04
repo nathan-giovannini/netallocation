@@ -50,7 +50,7 @@ def get_non_ext_branches_i(n, branch_components=None):
 def get_ext_one_ports_i(n, per_carrier=True):
     "Get a pd.Multiindex for all extendable branches in the network."
     check_carriers(n)
-    comps = n.one_port_components & set(nominal_attrs)
+    comps = set(check_one_port_comps(None, n)) & set(nominal_attrs)
     if per_carrier:
         return pd.MultiIndex.from_frame(pd.concat(n.df(c).loc[
             get_extendable_i(n, c), ['bus', 'carrier']] for c in comps))
@@ -61,7 +61,7 @@ def get_ext_one_ports_i(n, per_carrier=True):
 def get_non_ext_one_ports_i(n, per_carrier=True):
     "Get a pd.Multiindex for all non-extendable branches in the network."
     check_carriers(n)
-    comps = n.one_port_components & set(nominal_attrs)
+    comps = set(check_one_port_comps(None, n)) & set(nominal_attrs)
     if per_carrier:
         return pd.MultiIndex.from_frame(pd.concat(n.df(c).loc[
             get_non_extendable_i(n, c), ['bus', 'carrier']] for c in comps))
@@ -72,13 +72,13 @@ def get_non_ext_one_ports_i(n, per_carrier=True):
 def get_ext_one_ports_b(n):
     check_carriers(n)
     gen = [reindex_by_bus_carrier(n.df(c)[attr + '_extendable'], c, n)
-           for c, attr in nominal_attrs.items() if c in n.one_port_components]
+           for c, attr in nominal_attrs.items() if c in check_one_port_comps(None, n)]
     return xr.concat(gen, dim='carrier').astype(bool)
 
 
 def get_ext_branches_b(n):
     ds = pd.concat({c: n.df(c)[attr + '_extendable'] for c, attr
-                    in nominal_attrs.items() if c in sorted(n.branch_components)},
+                    in nominal_attrs.items() if c in check_branch_comps(None, n)},
                    names=['component', 'branch_i'])
     return xr.DataArray(ds, dims='branch')
 
@@ -107,10 +107,9 @@ def generation_carriers(n):
 def snapshot_weightings(n, snapshots=None):
     snapshots = check_snapshots(snapshots, n)
     w = n.snapshot_weightings.loc[snapshots]
-    if isinstance(w, pd.Series):
-        return xr.DataArray(w, dims='snapshot')
-    else:
-        return w
+    if isinstance(w, pd.DataFrame):  # pypsa >= 0.18 has one column per use
+        w = w['generators']
+    return xr.DataArray(w, dims='snapshot')
 
 
 def filter_null(da, dim=None):
@@ -241,17 +240,20 @@ def reindex_by_bus_carrier(df, c, n):
 
     """
     check_duplicated_carrier(n)
+    names = ['bus', 'carrier']
+    static = n.df(c)
     if isinstance(df, pd.DataFrame):
-        df = df.rename(columns=n.df(
-            c)[['bus', 'carrier']].apply(tuple, axis=1))
-        df.columns = pd.MultiIndex.from_tuples(
-            df.columns, names=['bus', 'carrier'])
+        df = df.copy()
+        df.columns = pd.MultiIndex.from_arrays(
+            [static.bus.reindex(df.columns).to_numpy(),
+             static.carrier.reindex(df.columns).to_numpy()], names=names)
         return xr.DataArray(df, dims=['snapshot', 'dim_1'])\
                  .unstack('dim_1', fill_value=0)
     else:
-        df = df.rename(n.df(c)[['bus', 'carrier']].apply(tuple, axis=1))
-        df.index = pd.MultiIndex.from_tuples(
-            df.index, names=['bus', 'carrier'])
+        df = df.copy()
+        df.index = pd.MultiIndex.from_arrays(
+            [static.bus.reindex(df.index).to_numpy(),
+             static.carrier.reindex(df.index).to_numpy()], names=names)
         return xr.DataArray(df).unstack('dim_0', fill_value=0)
 
 
@@ -281,7 +283,7 @@ def check_dataset(ds):
 
 def check_duplicated_carrier(n):
     check_carriers(n)
-    dupl = pd.Series({c: n.df(c).carrier.unique() for c in n.one_port_components if 'carrier' in n.df(
+    dupl = pd.Series({c: n.df(c).carrier.unique() for c in check_one_port_comps(None, n) if 'carrier' in n.df(
         c)}).explode()[lambda ds: ds.duplicated(keep=False)].dropna()
     assert dupl.empty, (f'The carrier name(s) {dupl.to_list()} appear in more '
                         f'than one component {dupl.index}. This will not work '
@@ -298,14 +300,19 @@ def check_carriers(n):
     n : pypsa.Network
 
     """
-    if 'carrier' not in n.loads:
-        n.loads['carrier'] = 'Load'
-    if 'carrier' not in n.stores:
-        n.stores['carrier'] = n.stores.bus.map(n.buses.carrier)
-    if 'carrier' not in n.lines:
-        n.lines['carrier'] = n.lines.bus0.map(n.buses.carrier)
-    if 'carrier' not in n.links:
-        n.links['carrier'] = n.links.bus0.map(n.buses.carrier)
+    # newer pypsa versions define an (empty) carrier column for all components
+    defaults = {'loads': lambda: pd.Series('Load', n.loads.index),
+                'stores': lambda: n.stores.bus.map(n.buses.carrier),
+                'lines': lambda: n.lines.bus0.map(n.buses.carrier),
+                'links': lambda: n.links.bus0.map(n.buses.carrier)}
+    for name, default in defaults.items():
+        df = getattr(n, name)
+        if 'carrier' not in df:
+            df['carrier'] = default()
+        else:
+            empty = df['carrier'].isna() | (df['carrier'] == '')
+            if empty.any():
+                df.loc[empty, 'carrier'] = default()[empty]
 
 
 def check_snapshots(arg, n):
@@ -329,7 +336,12 @@ def set_default_if_none(arg, n, attr):
     """
     Set any argument to an attribute of n if None
     """
-    return sorted(getattr(n, attr)) if arg is None else sorted(arg)
+    if arg is not None:
+        return sorted(arg)
+    # components introduced in newer pypsa versions are ignored if unused
+    new_comps = {'Process', 'ShuntImpedance'}
+    return sorted(c for c in getattr(n, attr)
+                  if c not in new_comps or not n.df(c).empty)
 
 
 def check_passive_branch_comps(arg, n):
